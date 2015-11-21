@@ -1,0 +1,175 @@
+---
+title: "Prediction of Weight Lifting Quality from Sensor Data"
+author: "Luke Sheneman"
+date: "November 20, 2015"
+output: html_document
+---
+
+```{r echo=FALSE}
+
+library(ggplot2)
+library(lattice)
+library(e1071)
+library(plyr)
+library(caret)
+library(ipred)
+
+
+set.seed(1234)
+
+preprocess_data <- function(d, dtype, test_col_names) {
+  
+  # limit our columns to the ones we know are not entirely missing values in the testing dataset
+  if (dtype == "training") {
+    tmp_classe <- as.factor(d$classe)
+  }
+  nd <- d[,names(d) %in% test_col_names]
+  
+  # save the factor variable "user_name"
+  tmp_user_name   = as.factor(nd$user_name)
+  
+  # convert all integer columns to numeric columns for better interoperability
+  for (i in 1:ncol(nd)) {
+    if(class(nd[,i])=="integer") {
+      nd[,i] <- as.numeric(nd[,i])
+    }
+  }
+  
+  # temporarily remove the factor variables
+  nd$user_name  <- NULL;
+  nd$classe     <- NULL;
+  
+  # impute missing values across all columns by computing the mean of the column
+  # and replacing missing values with that mean
+  for(i in 1:ncol(nd)) {
+    col_mean <- mean(nd[,i], na.rm = TRUE)
+    nd[!complete.cases(nd[,i]),i] <- col_mean
+  }
+
+  # re-add a subset of the removed factor variables
+  nd$user_name <- tmp_user_name
+  
+  if(dtype == "training") {
+    nd$classe <- tmp_classe
+  }
+  
+  # return the processed data frame
+  return(nd)
+}
+
+```
+
+## Introduction
+
+Given the ubiquity of highly accurate wearable sensors, it is now possible to use very specific quantitative sensor data to qualitatively assess specific human movements or exercises.   Using the provided Weight Lifting Exercise (WLE) dataset [^1], we develop highly accurate statistical models that can classify and determine whether a human subject is performing a specific weight-lifting excersize correctly.   This report explains how the data was preprocessed, how models were trained and cross validated, and how we assessed the accuracy of these models in classifying and predicting the *quality* of new weight-lifting exercises from our training data set.
+
+[^1]:  Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.  http://groupware.les.inf.puc-rio.br/har
+
+## Reading and Pre-Processing the Training and Testing Data Sets
+
+The provided training and test datasets were downloaded and stored locally.   These files were read using the read.csv() command, with specific care to handle missing values.
+
+```{r echo=TRUE}
+# Read the training dataset and mark things as NA a needed
+training_data <- 
+    read.csv("pml-training.csv", 
+    stringsAsFactors=FALSE,na.strings=c("NA","","#DIV/0!"))
+
+testing_data <- 
+  read.csv("pml-testing.csv", 
+           stringsAsFactors=FALSE,na.strings=c("NA","","#DIV/0!"))
+```
+
+This resulted in a training dataset of 160 variables and 19,622 observations.   The testing dataset was read in at 160 variables but with only 20 observations. 
+
+The training dataset includes observations from 6 unique human subjects and mainly includes variables assessing the roll, pitch, yaw, and acceleration of sensors on the arm, forearm, and dumbell work/used by the subjects in the experiment.   Measurements were taken across time with a sliding time window.   Many variables describe summary statistics (mean, standard deviation, skewness, etc.) for entire time windows and were only populated where the observation was marked as the beginning of a new time window.   Finally, the training dataset included a *classe* variable describing the correct qualitative classification of the weight lifting exercise.  This was a factor variable where level "A" represents the correct form while levels B, C, D, and E represent some incorrect form.
+
+Because the testing dataset only contained 20 observations, and many variables were summary statistics, much of the testing dataset was unusable and filled entirely with NA values.   Obviously these would not be usable in training and then assessing the model against the test data, so these variables were removed entirely from the analysis.   While "looking" at the testing dataset is generally unacceptable, it was necessary in this case in order to at least reduce the variables used in the training and model fitting to the appropriate subset.
+
+```{r echo=TRUE}
+# remove all columns in the testing dataset for which there are ONLY missing values and 
+# remove a couple other unhelpful columns as well
+new_testing_data <- testing_data[,colSums(is.na(testing_data)) != nrow(testing_data)]
+new_testing_data$new_window     <- NULL
+new_testing_data$X              <- NULL
+new_testing_data$num_window     <- NULL
+new_testing_data$problem_id     <- NULL
+new_testing_data$cvtd_timestamp <- NULL
+```
+
+We then pre-processed the data using a custom function:
+
+```{r echo=TRUE}
+# pre-process the datasets to set the stage for modeling and prediction
+new_training_data <- 
+    preprocess_data(training_data,dtype="training",test_col_names=names(new_testing_data))
+new_testing_data  <- 
+    preprocess_data(new_testing_data,dtype="testing",test_col_names=names(new_testing_data))
+
+```
+
+This pre-processing function did a couple basic things:
+  * Imputed missing values using the column mean
+  * Converted **integer** types to **numeric** for consistency
+  * Converted some columns to factors (e.g. classe)
+
+At the end of the preprocessing, the testing and training datasets were of basically the same form and could be used for training and prediction.  The final dataset dimensions were reduced from 160 variables down to 55 variables.   The training dataset also had the additional *classe* outcome column.
+
+# Model Selection and Cross-Validation
+
+We decide to initially try to construct a model where the outcome is a function of *all* other predictor variables.   (i.e. classe ~ .)    We first try a simple and fast *Recursive Partitioning and Regression Tree* (rpart) model.    In order to assess the validity of this method, we cross-validate using K-Fold cross-validation with k = 5 folds.
+
+```{r echo=TRUE,cache=TRUE}
+control <- trainControl(method="cv", number=5)
+modelfit <- train(classe ~ ., data=new_training_data, trControl=control, method="rpart")
+```
+
+Using the K-Fold cross-validated model, we predict against the whole original training data set:  and compute a confusion matrix:
+
+```{r echo=TRUE,cache=TRUE}
+# predict new results given the model and the small testing data
+predictions <- predict(modelfit, new_training_data)
+
+cm <- confusionMatrix(predictions,new_training_data$classe)
+print(cm)
+```
+
+The assessed accuracy of this prediction model was **very low** at only approximately 0.5.   In particular, this *rpart* approach seemed pathologically unable to successfully predict "Class D" outcomes *at all*.   
+
+**Out of Sample Error Estimate:**  Using K-Fold cross validation with the rpart method, I found an accuracy rate of only about 50%.   I would therefore estimate an *out of sample* error rate of approximately 50% when this model is applied to the test dataset. 
+
+We then peform the more rigorous and computationally intensive approach of bootstrap aggregation (i.e. "Bagging") using the *treebag* algorithm:
+
+```{r echo=TRUE,cache=TRUE}
+control <- trainControl(method="cv", number=5)
+modelfit <- train(classe ~ ., data=new_training_data, trControl=control, method="treebag")
+print(modelfit$finalModel)
+
+# predict new results given the model and the small testing data
+predictions <- predict(modelfit, new_training_data)
+
+cm <- confusionMatrix(predictions,new_training_data$classe)
+print(cm)
+```
+
+According to the confusion matrix, cross-validated bagging produced a significantly better classifier with an accuracy closer to 0.99 **and only one missclassification!**
+
+**Out of Sample Error Estimate:**  Using K-Fold cross validation with the bagging method via the treebag algorithm, I found an accuracy rate in excess of 99%.   I would therefore estimate an *out of sample* error rate of <1% when this model is applied to the test dataset. 
+
+# Final Prediction
+
+Given that K-fold cross-validated bagging using the model (classe ~ .) produced such accurate results, we decide to use this method to predict against the test dataset:
+
+```{r echo=TRUE,cache=TRUE}
+final_prediction <- predict(modelfit, new_testing_data)
+print(final_prediction)
+```
+
+As a final validation of the bagging approach, we re-train the model against the entire training set *without* K-fold cross-validating and use the resultant model to predict against the test dataset.   We get the same set of predictions:
+
+```{r echo=TRUE,cache=TRUE}
+control <- trainControl(method="none", verboseIter=TRUE)
+modelfit <- train(classe ~ ., data=new_training_data, trControl=control, method="treebag")
+final_prediction <- predict(modelfit, new_testing_data)
+print(final_prediction)
+```
